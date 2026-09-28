@@ -1,0 +1,172 @@
+# Builds the private crazylin/quicksa-next-poc repository on public
+# GitHub-hosted runners. This repository contains no source code: the source
+# is checked out at run time with a read-only deploy key.
+#
+# Security notes:
+# - Manual trigger only. There is no push/pull_request trigger, so forks and
+#   outside pull requests can never run this workflow or see the secret.
+# - SOURCE_DEPLOY_KEY is a read-only deploy key for quicksa-next-poc only.
+#   It is used by the checkout step and not persisted on the runner.
+# - Logs of a public repository are public. Nothing is uploaded as an
+#   artifact; delete runs whose logs should not stay visible.
+# - The inputs are only passed to action `with:` fields, never interpolated
+#   into shell scripts.
+#
+# Keep the build steps in sync with quicksa-next-poc
+# .github/workflows/build.yml (artifact upload intentionally omitted).
+name: Build quicksa-next-poc
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit of quicksa-next-poc to build
+        required: true
+        default: main
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: crazylin/quicksa-next-poc
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Record source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Source commit: $(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                g++ \
+                ninja-build \
+                pkg-config \
+                libsqlite3-dev \
+                libgl1-mesa-dev \
+                libegl1-mesa-dev \
+                libx11-dev \
+                libxext-dev \
+                libxrandr-dev \
+                libxcursor-dev \
+                libxfixes-dev \
+                libxi-dev \
+                libxss-dev \
+                libxtst-dev \
+                libxkbcommon-dev \
+                libwayland-dev \
+                libdecor-0-dev \
+                libdbus-1-dev \
+                libudev-dev
+              ;;
+            macOS)
+              brew install ninja sdl3
+              ;;
+            Windows)
+              # windows-2025 exports VCPKG_INSTALLATION_ROOT, not VCPKG_ROOT.
+              vcpkg_root="${VCPKG_INSTALLATION_ROOT:-${VCPKG_ROOT:-C:/vcpkg}}"
+              vcpkg_root="${vcpkg_root//\\//}"
+              echo "QUICKSA_VCPKG_ROOT=${vcpkg_root}" >> "${GITHUB_ENV}"
+              "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows sdl3:x64-windows
+              ;;
+          esac
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_TESTING=OFF
+            -DQUICKSA_BUILD_DESKTOP=ON
+            -DQUICKSA_BUILD_VTK_SMOKE=OFF
+          )
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(
+              -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            )
+          fi
+          cmake "${cmake_args[@]}"
+
+      - name: Compile
+        shell: bash
+        run: cmake --build build --target quicksa_next_poc
+
+      - name: Configure headless tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_args=(
+            -S .
+            -B build-headless
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_TESTING=ON
+            -DQUICKSA_BUILD_DESKTOP=OFF
+            -DQUICKSA_BUILD_VTK_SMOKE=OFF
+          )
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(
+              -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            )
+          fi
+          cmake "${cmake_args[@]}"
+
+      - name: Build headless tests
+        run: cmake --build build-headless
+
+      - name: Run headless tests
+        run: ctest --test-dir build-headless --output-on-failure
+
+      - name: Install the app layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix dist
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            find build \( -name 'SDL3.dll' -o -name 'sqlite3.dll' \) -exec cp {} dist/ \;
+            mkdir -p dist/licenses
+            for notice in \
+              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows/share/sdl3/copyright" \
+              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows/share/sqlite3/copyright"; do
+              if [ -f "${notice}" ]; then
+                package_name="$(basename "$(dirname "${notice}")")"
+                cp "${notice}" "dist/licenses/${package_name}-copyright.txt"
+              fi
+            done
+          fi
+          find dist -maxdepth 3 -type f -print

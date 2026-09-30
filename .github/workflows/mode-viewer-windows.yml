@@ -1,21 +1,26 @@
-# Builds the Stage 4 VTK spike of quicksa_mode_viewer (quicksa-next-poc
-# ADR-013) on Windows and uploads a runnable folder for manual testing on a
-# real Windows GPU. The source is checked out at run time with the read-only
-# deploy key, as in build.yml.
+# Builds the Stage 4 mode-shape viewer (quicksa-next-poc ADR-013) on Windows
+# and uploads runnable folders for manual testing on a real Windows GPU. The
+# source is checked out at run time with the read-only deploy key, as in
+# build.yml.
+#
+# - opengl (always): OpenGL renderer only, SDL3 and the C++ runtime linked
+#   statically (/MT). One exe that needs only Windows system DLLs, no
+#   msvcp140*/vcruntime140* (VC++ Redistributable) and no VTK.
+# - vtk (input vtk=true): the VTK renderer as well, shared VTK DLLs.
 #
 # Security notes (differences from build.yml):
 # - Manual trigger only; forks and pull requests never run it.
-# - Unlike build.yml this workflow DOES upload an artifact: the compiled
+# - Unlike build.yml this workflow DOES upload artifacts: the compiled
 #   viewer (binaries, no source code) plus generated sample UFF files.
 #   Artifacts of a public repository can be downloaded by any signed-in
 #   GitHub user, so retention is kept short (3 days). Delete the run when
 #   the test is done.
-# - The inputs are only passed to action `with:` fields, never interpolated
-#   into shell scripts.
+# - The inputs are only passed to action `with:` fields or `if:`
+#   expressions, never interpolated into shell scripts.
 #
 # Keep the steps in sync with quicksa-next-poc
 # .github/workflows/mode-viewer-windows.yml.
-name: Mode viewer (Windows, VTK)
+name: Mode viewer (Windows)
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +28,10 @@ on:
         description: Branch, tag, or commit of quicksa-next-poc to build
         required: true
         default: stage4-vtk-shape-spike-2026-09-30
+      vtk:
+        description: Also build the VTK variant (about 30 min without cache)
+        type: boolean
+        default: false
 concurrency:
   group: mode-viewer-windows-${{ inputs.ref }}
   cancel-in-progress: true
@@ -32,7 +41,108 @@ env:
   VTK_VERSION: "9.7.1"
   VTK_PREFIX: "C:/vtk"
 jobs:
-  build:
+  opengl:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: crazylin/quicksa-next-poc
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Record source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Source commit: $(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+      - name: Install static SDL3 and SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          vcpkg_root="${VCPKG_INSTALLATION_ROOT:-${VCPKG_ROOT:-C:/vcpkg}}"
+          vcpkg_root="${vcpkg_root//\\//}"
+          echo "QUICKSA_VCPKG_ROOT=${vcpkg_root}" >> "${GITHUB_ENV}"
+          "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows-static sdl3:x64-windows-static
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DBUILD_TESTING=OFF \
+            -DQUICKSA_BUILD_DESKTOP=ON \
+            -DQUICKSA_BUILD_VTK_SMOKE=OFF \
+            -DQUICKSA_BUILD_MODE_VIEWER=ON \
+            -DQUICKSA_MODE_VIEWER_VTK=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      - name: Compile
+        run: cmake --build build --target quicksa_mode_viewer
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=dist/quicksa-mode-viewer
+          mkdir -p "${out}/licenses" "${out}/samples"
+          cp build/quicksa_mode_viewer.exe "${out}/"
+          cp -r build/assets "${out}/"
+          cp THIRD_PARTY.md "${out}/"
+          cp "${QUICKSA_VCPKG_ROOT}/installed/x64-windows-static/share/sdl3/copyright" "${out}/licenses/sdl3.txt"
+          cp build/_deps/imgui-src/LICENSE.txt "${out}/licenses/imgui.txt"
+          cp build/_deps/implot-src/LICENSE "${out}/licenses/implot.txt"
+          python tools/modal/write_plate_scan_uff.py --output "${out}/samples/plate.uff"
+          python tools/modal/write_plate_scan_uff.py --output "${out}/samples/plate_mm_minus_z_binary.uff" \
+            --binary --millimetres --direction -3 --triangles
+          python tools/modal/write_plate_scan_uff.py --output "${out}/samples/plate_large.uff" \
+            --nx 160 --ny 120 --lines 41 --binary
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_mode_viewer.exe samples\plate.uff --renderer opengl' > "${out}/run-opengl.bat"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_mode_viewer.exe samples\plate.uff --renderer cpu' > "${out}/run-cpu.bat"
+          printf '%s\r\n' \
+            'QuickSA mode-shape viewer - Stage 4 PoC (ADR-013), OpenGL build' \
+            '' \
+            'run-opengl.bat  opens samples\plate.uff with the OpenGL renderer' \
+            'run-cpu.bat     the same with the CPU renderer, for comparison' \
+            '' \
+            'Single exe: SDL3 and the C++ runtime are linked in, so the VC++' \
+            'Redistributable (msvcp140*.dll) is not needed.' \
+            'Other files: File > Open, or drop a UFF file on the window.' > "${out}/README.txt"
+          find "${out}" -maxdepth 1 -type f | sort
+      # Only Windows system DLLs: no VC++ runtime, SDL3 or VTK DLL.
+      - name: Check DLL dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          dumpbin //dependents dist/quicksa-mode-viewer/quicksa_mode_viewer.exe | tee dependents.txt
+          if grep -iE 'msvcp|vcruntime|api-ms-win-crt|sdl3|vtk|sqlite' dependents.txt; then
+            echo "unexpected non-system DLL dependency"
+            exit 1
+          fi
+      # No OpenGL driver on the runner: checks start-up and argument parsing
+      # (usage exit code 64).
+      - name: Start-up check
+        shell: bash
+        run: |
+          set +e
+          dist/quicksa-mode-viewer/quicksa_mode_viewer.exe --help
+          code=$?
+          echo "exit code ${code}"
+          test "${code}" -eq 64
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quicksa-mode-viewer-windows-opengl
+          path: dist/quicksa-mode-viewer
+          if-no-files-found: error
+          retention-days: 3
+  vtk:
+    if: inputs.vtk
     runs-on: windows-latest
     timeout-minutes: 150
     steps:

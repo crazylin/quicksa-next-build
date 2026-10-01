@@ -4,16 +4,33 @@
 #
 # Security notes:
 # - Manual trigger only. There is no push/pull_request trigger, so forks and
-#   outside pull requests can never run this workflow or see the secret.
+#   outside pull requests can never run this workflow or see the secrets.
 # - SOURCE_DEPLOY_KEY is a read-only deploy key for quicksa-next-poc only.
 #   It is used by the checkout step and not persisted on the runner.
 # - Logs of a public repository are public. Nothing is uploaded as an
 #   artifact; delete runs whose logs should not stay visible.
 # - The inputs are only passed to action `with:` fields, never interpolated
 #   into shell scripts.
+# - Build caches live in this repository's Actions cache. Only workflow runs
+#   of this repository can read them, which includes an approved pull request
+#   from a fork (it can read the default branch's caches). The vcpkg cache
+#   holds third-party packages only (SDL3, SQLite). The compiler cache holds
+#   objects compiled from the private source, so it is stored encrypted
+#   (AES-256-CBC, PBKDF2 key from the secret CACHE_ENCRYPTION_KEY, which such
+#   runs never see). Without the secret nothing is saved or restored.
+#
+# Caches (a miss or a broken cache only costs time):
+# - Windows: vcpkg binary packages, one entry per runner image version.
+# - All hosts: sccache compiler cache for C and C++, one entry per run,
+#   restored from the newest entry of the same OS; prune-caches keeps only
+#   the newest entry per OS. sccache reuses an object only when its hash of
+#   the preprocessed source, the compiler and its arguments matches.
 #
 # Keep the build steps in sync with quicksa-next-poc
-# .github/workflows/build.yml (artifact upload intentionally omitted).
+# .github/workflows/build.yml (artifact upload intentionally omitted). The
+# cache steps exist only here; CMake takes the compiler launcher from the
+# CMAKE_<LANG>_COMPILER_LAUNCHER environment variables, so the configure and
+# build commands stay the same.
 name: Build quicksa-next-poc
 
 on:
@@ -30,6 +47,13 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # sccache (Mozilla, Apache-2.0) release and the SHA-256 of its archives.
+  SCCACHE_VERSION: v0.18.0
+  SCCACHE_SHA256_LINUX_X64: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+  SCCACHE_SHA256_MACOS_ARM64: 308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e
+  SCCACHE_SHA256_WINDOWS_X64: 1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b
 
 jobs:
   build:
@@ -57,6 +81,28 @@ jobs:
         run: |
           set -euo pipefail
           echo "Source commit: $(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY}"
+
+      # vcpkg stores the packages it builds in VCPKG_DEFAULT_BINARY_CACHE and
+      # installs them from there on a later run. The runner image fixes the
+      # vcpkg and MSVC versions, so the key is the image version.
+      - name: Prepare vcpkg package cache
+        if: runner.os == 'Windows'
+        id: vcpkg-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          archives="$(cygpath -u "${RUNNER_TEMP}")/vcpkg-archives"
+          mkdir -p "${archives}"
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$(cygpath -w "${archives}")" >> "${GITHUB_ENV}"
+          echo "key=vcpkg-x64-windows-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore vcpkg packages
+        if: runner.os == 'Windows'
+        id: vcpkg-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-archives
+          key: ${{ steps.vcpkg-cache-key.outputs.key }}
 
       - name: Install dependencies
         shell: bash
@@ -98,9 +144,100 @@ jobs:
               ;;
           esac
 
+      - name: Save vcpkg packages
+        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-archives
+          key: ${{ steps.vcpkg-cache-key.outputs.key }}
+
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/sccache.tar.enc
+          key: sccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sccache-${{ runner.os }}-
+
+      # Installs sccache, unpacks the restored cache and starts the server.
+      # The compiler launcher is set only once sccache runs, so any failure
+      # here leaves an uncached build.
+      - name: Set up compiler cache
+        id: sccache
+        continue-on-error: true
+        shell: bash
+        env:
+          CACHE_ENCRYPTION_KEY: ${{ secrets.CACHE_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64) target=x86_64-unknown-linux-musl; sha256="${SCCACHE_SHA256_LINUX_X64}" ;;
+            macOS-ARM64) target=aarch64-apple-darwin; sha256="${SCCACHE_SHA256_MACOS_ARM64}" ;;
+            Windows-X64) target=x86_64-pc-windows-msvc; sha256="${SCCACHE_SHA256_WINDOWS_X64}" ;;
+            *) echo "::warning::no sccache build for ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+          esac
+          native() {
+            if [ "${RUNNER_OS}" = "Windows" ]; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+          }
+          temp_dir="${RUNNER_TEMP}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then temp_dir="$(cygpath -u "${RUNNER_TEMP}")"; fi
+          cd "${temp_dir}"
+
+          archive="sccache-${SCCACHE_VERSION}-${target}.tar.gz"
+          curl -fsSL --retry 3 -o "${archive}" \
+            "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${archive}"
+          if command -v sha256sum > /dev/null; then
+            actual="$(sha256sum "${archive}" | cut -d ' ' -f 1)"
+          else
+            actual="$(shasum -a 256 "${archive}" | cut -d ' ' -f 1)"
+          fi
+          if [ "${actual}" != "${sha256}" ]; then
+            echo "::error::sccache archive checksum mismatch (${actual})"
+            exit 1
+          fi
+          mkdir -p sccache-bin
+          tar -xzf "${archive}" -C sccache-bin --strip-components=1
+          rm -f "${archive}"
+          ./sccache-bin/sccache --version
+
+          mkdir -p sccache
+          if [ -z "${CACHE_ENCRYPTION_KEY}" ]; then
+            echo "::warning::CACHE_ENCRYPTION_KEY is not set: the compiler cache is neither restored nor saved"
+            rm -f sccache.tar.enc
+          elif [ -f sccache.tar.enc ]; then
+            if openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 100000 \
+                 -pass env:CACHE_ENCRYPTION_KEY -in sccache.tar.enc -out sccache.tar &&
+               tar -xf sccache.tar; then
+              echo "Restored compiler cache: $(du -sh sccache | cut -f 1)"
+            else
+              echo "::warning::the restored compiler cache cannot be decrypted or unpacked; building without it"
+              rm -rf sccache
+              mkdir -p sccache
+            fi
+            rm -f sccache.tar sccache.tar.enc
+          else
+            echo "No compiler cache restored"
+          fi
+
+          export SCCACHE_DIR="$(native "${temp_dir}/sccache")"
+          # A full build is about 50 MB (clang); MSVC objects are larger.
+          export SCCACHE_CACHE_SIZE=500M
+          export SCCACHE_IDLE_TIMEOUT=0
+          # Compile locally instead of failing when the server is unreachable.
+          export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+          ./sccache-bin/sccache --start-server
+          native "${temp_dir}/sccache-bin" >> "${GITHUB_PATH}"
+          {
+            echo "SCCACHE_DIR=${SCCACHE_DIR}"
+            echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}"
+            echo "SCCACHE_IDLE_TIMEOUT=${SCCACHE_IDLE_TIMEOUT}"
+            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=${SCCACHE_IGNORE_SERVER_IO_ERROR}"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "${GITHUB_ENV}"
 
       - name: Configure
         shell: bash
@@ -170,3 +307,68 @@ jobs:
             done
           fi
           find dist -maxdepth 3 -type f -print
+
+      # Also after a failed build or test: the objects compiled so far stay
+      # valid.
+      - name: Pack compiler cache
+        id: sccache-pack
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        shell: bash
+        env:
+          CACHE_ENCRYPTION_KEY: ${{ secrets.CACHE_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Compiler cache (${RUNNER_OS})"
+            echo '```'
+            sccache --show-stats || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          # Stopping the server flushes its cache writes before packing.
+          sccache --stop-server > /dev/null || true
+          if [ -z "${CACHE_ENCRYPTION_KEY}" ]; then
+            exit 0
+          fi
+          temp_dir="${RUNNER_TEMP}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then temp_dir="$(cygpath -u "${RUNNER_TEMP}")"; fi
+          cd "${temp_dir}"
+          tar -cf sccache.tar sccache
+          openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 100000 -salt \
+            -pass env:CACHE_ENCRYPTION_KEY -in sccache.tar -out sccache.tar.enc
+          rm -f sccache.tar
+          echo "Compiler cache: $(du -sh sccache | cut -f 1), encrypted archive $(du -sh sccache.tar.enc | cut -f 1)"
+          echo "save=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Save compiler cache
+        if: ${{ !cancelled() && steps.sccache-pack.outputs.save == 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/sccache.tar.enc
+          key: sccache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # Every run saves a new compiler cache entry per OS; only the newest one is
+  # restored, so the older ones are deleted. Runs no source code, so the
+  # cache write permission stays out of the build job.
+  prune-caches:
+    name: Prune compiler caches
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the newest compiler cache per OS
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for os in Linux macOS Windows; do
+            gh cache list --key "sccache-${os}-" --ref "${GITHUB_REF}" \
+                --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
+              while read -r id; do
+                gh cache delete "${id}"
+              done
+          done
+          gh cache list --ref "${GITHUB_REF}" --limit 100

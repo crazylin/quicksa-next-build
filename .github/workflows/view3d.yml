@@ -1,0 +1,112 @@
+# Builds the View3D component of the private crazylin/quicksa-next-poc
+# repository (ADR-015: library, OpenGL renderer, demo) and runs its tests on
+# the three desktop platforms. Same security model as build.yml:
+# - manual trigger only (no push/pull_request trigger, so forks and outside
+#   pull requests never run this workflow or see the secret);
+# - SOURCE_DEPLOY_KEY is a read-only deploy key, not persisted on the runner;
+# - inputs are only passed to `with:` fields, never interpolated into shell;
+# - nothing is uploaded as an artifact (logs of a public repository are public).
+name: View3D (three platforms)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit of quicksa-next-poc to build
+        required: true
+        default: main
+concurrency:
+  group: view3d-${{ inputs.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  view3d:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: crazylin/quicksa-next-poc
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Record source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Source commit: $(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                g++ \
+                ninja-build \
+                pkg-config \
+                libsqlite3-dev \
+                libgl1-mesa-dev \
+                libegl1-mesa-dev \
+                libx11-dev \
+                libxext-dev \
+                libxrandr-dev \
+                libxcursor-dev \
+                libxfixes-dev \
+                libxi-dev \
+                libxss-dev \
+                libxtst-dev \
+                libxkbcommon-dev \
+                libwayland-dev \
+                libdecor-0-dev \
+                libdbus-1-dev \
+                libudev-dev
+              ;;
+            macOS)
+              brew install ninja sdl3
+              ;;
+            Windows)
+              # windows-2025 exports VCPKG_INSTALLATION_ROOT, not VCPKG_ROOT.
+              vcpkg_root="${VCPKG_INSTALLATION_ROOT:-${VCPKG_ROOT:-C:/vcpkg}}"
+              vcpkg_root="${vcpkg_root//\\//}"
+              echo "QUICKSA_VCPKG_ROOT=${vcpkg_root}" >> "${GITHUB_ENV}"
+              "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows sdl3:x64-windows
+              ;;
+          esac
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_args=(
+            -S .
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_TESTING=ON
+            -DQUICKSA_BUILD_DESKTOP=ON
+            -DQUICKSA_BUILD_VTK_SMOKE=OFF
+            -DQUICKSA_BUILD_VIEW3D_DEMO=ON
+          )
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(
+              -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            )
+          fi
+          cmake "${cmake_args[@]}"
+      - name: Build View3D library, renderer, demo and tests
+        shell: bash
+        run: cmake --build build --target quicksa_view3d_demo view3d_frontend_smoke view3d_core_smoke
+      - name: Run View3D tests (headless)
+        run: ctest --test-dir build -R "^view3d_" --output-on-failure

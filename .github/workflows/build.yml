@@ -318,10 +318,12 @@ jobs:
           CACHE_ENCRYPTION_KEY: ${{ secrets.CACHE_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
+          stats="$(sccache --show-stats 2>&1 || true)"
+          printf '%s\n' "${stats}"
           {
             echo "### Compiler cache (${RUNNER_OS})"
             echo '```'
-            sccache --show-stats || true
+            printf '%s\n' "${stats}"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
           # Stopping the server flushes its cache writes before packing.

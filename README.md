@@ -23,6 +23,17 @@ artifacts.
 - All hosts: an [sccache](https://github.com/mozilla/sccache) compiler cache
   (pinned release, SHA-256 checked). Each run restores the newest entry for
   its OS and saves a new one; the `prune-caches` job deletes the older ones.
+  The entry keeps the objects of both runner image versions that alternate
+  while GitHub rolls out a new image, so only a compiler never seen before
+  builds cold.
+
+Measured on 2026-10-01 (job time, main of quicksa-next-poc): Windows
+726 s without caches, 126 s with warm caches (dependencies 104 → 14 s,
+app 117 → 10 s, headless tests 453 → 48 s); Linux 330 → about 100 s, macOS
+302 → about 60 s. A cold run with sccache is up to about 2 min slower on
+Windows than an uncached one (sccache preprocesses separately); MSVC
+objects of the same source in different test targets are not shared,
+because CMake passes each target's own `/Fd` path, which sccache hashes.
 
 The compiler cache contains objects compiled from the private source. A
 workflow run of a pull request from a fork can read this repository's

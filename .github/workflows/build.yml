@@ -24,7 +24,11 @@
 # - All hosts: sccache compiler cache for C and C++, one entry per run,
 #   restored from the newest entry of the same OS; prune-caches keeps only
 #   the newest entry per OS. sccache reuses an object only when its hash of
-#   the preprocessed source, the compiler and its arguments matches.
+#   the preprocessed source, the compiler and its arguments matches. While
+#   GitHub rolls out a new runner image, runs alternate between two image
+#   versions (on Windows often with different MSVC builds); the chain of
+#   entries then holds the objects of both compilers, and sccache evicts the
+#   least recently used ones beyond SCCACHE_CACHE_SIZE.
 #
 # Keep the build steps in sync with quicksa-next-poc
 # .github/workflows/build.yml (artifact upload intentionally omitted). The

@@ -278,6 +278,18 @@ jobs:
         shell: bash
         run: cmake --build build --target quicksa_next_poc
 
+      - name: Verify Windows stack reserve
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $headers = dumpbin /headers build/quicksa_next_poc.exe | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
+          $match = [regex]::Match($headers, '(?im)^\s*([0-9a-f]+)\s+size of stack reserve')
+          if (-not $match.Success) { throw "PE stack reserve was not found in dumpbin output" }
+          $reserve = [Convert]::ToInt64($match.Groups[1].Value, 16)
+          if ($reserve -lt 8388608) { throw "Expected at least 8 MiB stack reserve, got $reserve bytes" }
+          Write-Host "Windows stack reserve: $reserve bytes"
+
       - name: Configure headless tests
         shell: bash
         run: |

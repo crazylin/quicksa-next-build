@@ -21,7 +21,7 @@
 #   runs never see). Without the secret nothing is saved or restored.
 #
 # Caches (a miss or a broken cache only costs time):
-# - Windows: vcpkg binary packages, one entry per runner image version.
+# - Windows: vcpkg static-triplet packages, one entry per runner image version.
 # - All hosts: sccache compiler cache for C and C++, one entry per run,
 #   restored from the newest entry of the same OS; prune-caches keeps only
 #   the newest entry per OS. sccache reuses an object only when its hash of
@@ -105,7 +105,7 @@ jobs:
           archives="$(cygpath -u "${RUNNER_TEMP}")/vcpkg-archives"
           mkdir -p "${archives}"
           echo "VCPKG_DEFAULT_BINARY_CACHE=$(cygpath -w "${archives}")" >> "${GITHUB_ENV}"
-          echo "key=vcpkg-x64-windows-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "${GITHUB_OUTPUT}"
+          echo "key=vcpkg-x64-windows-static-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "${GITHUB_OUTPUT}"
 
       - name: Restore vcpkg packages
         if: runner.os == 'Windows'
@@ -151,7 +151,9 @@ jobs:
               vcpkg_root="${VCPKG_INSTALLATION_ROOT:-${VCPKG_ROOT:-C:/vcpkg}}"
               vcpkg_root="${vcpkg_root//\\//}"
               echo "QUICKSA_VCPKG_ROOT=${vcpkg_root}" >> "${GITHUB_ENV}"
-              "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows sdl3:x64-windows
+              # Link Windows dependencies and the MSVC runtime statically so
+              # the release ZIP runs without a separately installed VC++ runtime.
+              "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows-static sdl3:x64-windows-static
               ;;
           esac
 
@@ -266,6 +268,7 @@ jobs:
           if [ "${RUNNER_OS}" = "Windows" ]; then
             cmake_args+=(
               -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+              -DVCPKG_TARGET_TRIPLET=x64-windows-static
             )
           fi
           cmake "${cmake_args[@]}"
@@ -290,6 +293,7 @@ jobs:
           if [ "${RUNNER_OS}" = "Windows" ]; then
             cmake_args+=(
               -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+              -DVCPKG_TARGET_TRIPLET=x64-windows-static
             )
           fi
           cmake "${cmake_args[@]}"
@@ -309,8 +313,8 @@ jobs:
             find build \( -name 'SDL3.dll' -o -name 'sqlite3.dll' \) -exec cp {} dist/ \;
             mkdir -p dist/licenses
             for notice in \
-              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows/share/sdl3/copyright" \
-              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows/share/sqlite3/copyright"; do
+              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows-static/share/sdl3/copyright" \
+              "${QUICKSA_VCPKG_ROOT}/installed/x64-windows-static/share/sqlite3/copyright"; do
               if [ -f "${notice}" ]; then
                 package_name="$(basename "$(dirname "${notice}")")"
                 cp "${notice}" "dist/licenses/${package_name}-copyright.txt"

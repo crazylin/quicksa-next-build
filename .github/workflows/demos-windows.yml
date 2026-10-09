@@ -1,0 +1,247 @@
+# Builds the standalone QuickSA Next demo UIs from private source and uploads
+# only a Windows x64 package encrypted for a one-time release transfer.
+name: Desktop demos (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit of quicksa-next-poc to build
+        required: true
+        default: v0.1.1
+      include_modal_demo:
+        description: Include the Stage 4 modal-analysis technical demo
+        type: boolean
+        default: false
+      release_transfer_certificate:
+        description: Optional PEM certificate to encrypt the Windows demo package
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: desktop-demos-${{ inputs.ref }}-${{ inputs.include_modal_demo }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      QUICKSA_INCLUDE_MODAL_DEMO: ${{ inputs.include_modal_demo }}
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: crazylin/quicksa-next-poc
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Record source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Source commit: $(git rev-parse HEAD)" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Install static SDL3 and SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          vcpkg_root="${VCPKG_INSTALLATION_ROOT:-${VCPKG_ROOT:-C:/vcpkg}}"
+          vcpkg_root="${vcpkg_root//\\//}"
+          echo "QUICKSA_VCPKG_ROOT=${vcpkg_root}" >> "${GITHUB_ENV}"
+          "${vcpkg_root}/vcpkg.exe" install sqlite3:x64-windows-static sdl3:x64-windows-static
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_EXE_LINKER_FLAGS=/STACK:8388608 \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DBUILD_TESTING=OFF \
+            -DQUICKSA_BUILD_DESKTOP=ON \
+            -DQUICKSA_BUILD_VTK_SMOKE=OFF \
+            -DQUICKSA_BUILD_VIEW3D_DEMO=ON \
+            -DQUICKSA_BUILD_SCAN_LAYOUT_TOOL=ON \
+            -DQUICKSA_BUILD_SCAN_HEAD_SIM_TOOL=ON \
+            -DQUICKSA_BUILD_MODE_VIEWER=ON \
+            -DQUICKSA_BUILD_MODAL_DEMO="${QUICKSA_INCLUDE_MODAL_DEMO}" \
+            -DQUICKSA_MODE_VIEWER_VTK=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="${QUICKSA_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Compile demo interfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=(
+            quicksa_view3d_demo
+            quicksa_scan_layout_tool
+            quicksa_scan_head_sim_tool
+            quicksa_mode_viewer
+          )
+          if [ "${QUICKSA_INCLUDE_MODAL_DEMO}" = "true" ]; then
+            targets+=(quicksa_modal_demo)
+          fi
+          cmake --build build --target "${targets[@]}"
+
+      - name: Package Windows demos
+        shell: bash
+        env:
+          INCLUDE_MODAL_DEMO: ${{ inputs.include_modal_demo }}
+        run: |
+          set -euo pipefail
+          out=dist/quicksa-next-demos-windows-x64
+          mkdir -p "${out}/licenses" "${out}/samples"
+          for exe in \
+            quicksa_view3d_demo.exe \
+            quicksa_scan_layout_tool.exe \
+            quicksa_scan_head_sim_tool.exe \
+            quicksa_mode_viewer.exe; do
+            cp "build/${exe}" "${out}/"
+          done
+          if [ "${INCLUDE_MODAL_DEMO}" = "true" ]; then
+            cp build/quicksa_modal_demo.exe "${out}/"
+          fi
+          cp -R assets "${out}/assets"
+          cp THIRD_PARTY.md "${out}/"
+          cp build/THIRD_PARTY-BUILD.txt "${out}/"
+          cp "${QUICKSA_VCPKG_ROOT}/installed/x64-windows-static/share/sdl3/copyright" \
+            "${out}/licenses/sdl3-copyright.txt"
+          cp "${QUICKSA_VCPKG_ROOT}/installed/x64-windows-static/share/sqlite3/copyright" \
+            "${out}/licenses/sqlite3-copyright.txt"
+          cp build/_deps/imgui-src/LICENSE.txt "${out}/licenses/imgui.txt"
+          cp build/_deps/implot-src/LICENSE "${out}/licenses/implot.txt"
+          python tools/modal/write_plate_scan_uff.py --output "${out}/samples/plate.uff"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_view3d_demo.exe' > "${out}/run-view3d.bat"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_scan_layout_tool.exe' > "${out}/run-scan-layout.bat"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_scan_head_sim_tool.exe' > "${out}/run-scan-head-simulator.bat"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_mode_viewer.exe samples\plate.uff --renderer opengl' \
+            > "${out}/run-mode-viewer-opengl.bat"
+          printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+            'start "" quicksa_mode_viewer.exe samples\plate.uff --renderer cpu' \
+            > "${out}/run-mode-viewer-cpu.bat"
+          if [ "${INCLUDE_MODAL_DEMO}" = "true" ]; then
+            printf '%s\r\n' '@echo off' 'cd /d "%~dp0"' \
+              'start "" quicksa_modal_demo.exe' > "${out}/run-modal-demo.bat"
+          fi
+          cat > "${out}/README.txt" <<'EOF'
+          QuickSA Next standalone demo interfaces (Windows x64)
+
+          These are development and technical demos, not part of the Stage 1
+          QuickSA Next product UI. Close any window with its normal close button.
+
+          run-view3d.bat                 View3D charts and 3D views
+          run-scan-layout.bat            scan point layout editor
+          run-scan-head-simulator.bat    scanning-head simulator UI
+          run-mode-viewer-opengl.bat     UFF mode-shape viewer using OpenGL
+          run-mode-viewer-cpu.bat        UFF mode-shape viewer using CPU rendering
+
+          The samples/plate.uff file is a generated sample for the mode viewer.
+          You can also open another UFF file from the viewer's File menu.
+
+          The optional quicksa_modal_demo.exe is a separate Stage 4 technical
+          demo. Its numerical semantics and tolerances remain draft.
+          EOF
+          if [ "${INCLUDE_MODAL_DEMO}" != "true" ]; then
+            sed -i '/The optional quicksa_modal_demo.exe/,$d' "${out}/README.txt"
+          fi
+          find "${out}" -maxdepth 2 -type f -print | sort
+
+      - name: Verify stack reserve and static runtime dependencies
+        shell: pwsh
+        run: |
+          $executables = Get-ChildItem dist/quicksa-next-demos-windows-x64 -Filter '*.exe'
+          foreach ($exe in $executables) {
+            $headers = dumpbin /headers $exe.FullName | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $($exe.Name)" }
+            $stackMatch = [regex]::Match($headers, '(?im)^\s*([0-9a-f]+)\s+size of stack reserve')
+            if (-not $stackMatch.Success) { throw "PE stack reserve missing: $($exe.Name)" }
+            $reserve = [Convert]::ToInt64($stackMatch.Groups[1].Value, 16)
+            if ($reserve -lt 8388608) { throw "$($exe.Name): expected at least 8 MiB stack reserve, got $reserve" }
+            $imports = dumpbin /dependents $exe.FullName | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin dependency check failed for $($exe.Name)" }
+            if ($imports -match '(?im)(msvcp\d+|vcruntime\d+|SDL3\.dll|sqlite3\.dll)') {
+              throw "$($exe.Name) has an unexpected dynamic runtime dependency"
+            }
+            Write-Host "$($exe.Name): stack reserve $reserve bytes; runtime dependencies static"
+          }
+
+      # These argument checks exit before SDL/OpenGL initialization. The
+      # hosted runner has no display driver for a graphical smoke test.
+      - name: Check demo command lines
+        shell: bash
+        env:
+          INCLUDE_MODAL_DEMO: ${{ inputs.include_modal_demo }}
+        run: |
+          set -euo pipefail
+          set +e
+          build/quicksa_view3d_demo.exe --invalid > view3d-help.txt 2>&1
+          view3d_code=$?
+          build/quicksa_scan_layout_tool.exe --invalid > scan-layout-help.txt 2>&1
+          layout_code=$?
+          build/quicksa_scan_head_sim_tool.exe --invalid > scan-head-help.txt 2>&1
+          scan_head_code=$?
+          build/quicksa_mode_viewer.exe --help > mode-viewer-help.txt 2>&1
+          mode_viewer_code=$?
+          if [ "${INCLUDE_MODAL_DEMO}" = "true" ]; then
+            build/quicksa_modal_demo.exe --help > modal-help.txt 2>&1
+            modal_code=$?
+          fi
+          set -e
+          test "${view3d_code}" -eq 64
+          test "${layout_code}" -eq 2
+          test "${scan_head_code}" -eq 2
+          test "${mode_viewer_code}" -eq 64
+          if [ "${INCLUDE_MODAL_DEMO}" = "true" ]; then test "${modal_code}" -eq 0; fi
+
+      - name: Encrypt Windows demo package
+        id: encrypted-package
+        if: ${{ inputs.release_transfer_certificate != '' }}
+        shell: bash
+        env:
+          RELEASE_TRANSFER_CERTIFICATE: ${{ inputs.release_transfer_certificate }}
+        run: |
+          set -euo pipefail
+          certificate="${RUNNER_TEMP}/quicksa-demos-transfer-certificate.pem"
+          package="${RUNNER_TEMP}/quicksa-next-demos-windows-x64.zip"
+          encrypted="${package}.cms"
+          printf '%s\n' "${RELEASE_TRANSFER_CERTIFICATE}" > "${certificate}"
+          python - "${package}" <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          root = Path("dist/quicksa-next-demos-windows-x64")
+          files = sorted(path for path in root.rglob("*") if path.is_file())
+          if not files:
+              raise SystemExit("The Windows demo package is empty")
+          with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in files:
+                  archive.write(path, path.relative_to(root))
+          PY
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "${package}" -outform DER -out "${encrypted}" "${certificate}"
+          echo "Encrypted Windows demo package: ${encrypted}"
+
+      - name: Upload encrypted Windows demo package
+        if: ${{ inputs.release_transfer_certificate != '' && steps.encrypted-package.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quicksa-next-demos-windows-x64-${{ github.run_id }}
+          path: ${{ runner.temp }}/quicksa-next-demos-windows-x64.zip.cms
+          if-no-files-found: error
+          retention-days: 1

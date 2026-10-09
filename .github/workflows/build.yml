@@ -7,10 +7,11 @@
 #   outside pull requests can never run this workflow or see the secrets.
 # - SOURCE_DEPLOY_KEY is a read-only deploy key for quicksa-next-poc only.
 #   It is used by the checkout step and not persisted on the runner.
-# - Logs of a public repository are public. Nothing is uploaded as an
-#   artifact; delete runs whose logs should not stay visible.
-# - The inputs are only passed to action `with:` fields, never interpolated
-#   into shell scripts.
+# - Logs of a public repository are public. An opt-in Windows release package
+#   is uploaded only after encryption to a caller-supplied public certificate;
+#   the plaintext package stays on the runner for the private repository release.
+# - Workflow inputs are passed through action fields or environment values,
+#   never interpolated directly into shell scripts.
 # - Build caches live in this repository's Actions cache. Only workflow runs
 #   of this repository can read them, which includes an approved pull request
 #   from a fork (it can read the default branch's caches). The vcpkg cache
@@ -31,10 +32,11 @@
 #   least recently used ones beyond SCCACHE_CACHE_SIZE.
 #
 # Keep the build steps in sync with quicksa-next-poc
-# .github/workflows/build.yml (artifact upload intentionally omitted). The
-# cache steps exist only here; CMake takes the compiler launcher from the
-# CMAKE_<LANG>_COMPILER_LAUNCHER environment variables, so the configure and
-# build commands stay the same.
+# .github/workflows/build.yml. The optional Windows release-transfer artifact
+# is encrypted for a one-time private key and is not part of the source build.
+# The cache steps exist only here; CMake takes the compiler launcher from the
+# CMAKE_<LANG>_COMPILER_LAUNCHER environment variables, so configure and build
+# commands stay the same.
 name: Build quicksa-next-poc
 
 on:
@@ -44,6 +46,11 @@ on:
         description: Branch, tag, or commit of quicksa-next-poc to build
         required: true
         default: main
+      release_transfer_certificate:
+        description: Optional PEM certificate to encrypt a Windows release package for private transfer
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: build-${{ inputs.ref }}
@@ -311,6 +318,44 @@ jobs:
             done
           fi
           find dist -maxdepth 3 -type f -print
+
+      - name: Encrypt Windows release package
+        id: windows-release-package
+        if: ${{ runner.os == 'Windows' && inputs.release_transfer_certificate != '' }}
+        shell: bash
+        env:
+          RELEASE_TRANSFER_CERTIFICATE: ${{ inputs.release_transfer_certificate }}
+        run: |
+          set -euo pipefail
+          certificate="${RUNNER_TEMP}/quicksa-release-transfer-certificate.pem"
+          package="${RUNNER_TEMP}/quicksa-next-poc-windows-x64.zip"
+          encrypted="${package}.cms"
+          printf '%s\n' "${RELEASE_TRANSFER_CERTIFICATE}" > "${certificate}"
+          python - "${package}" <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          root = Path("dist")
+          files = sorted(path for path in root.rglob("*") if path.is_file())
+          if not files:
+              raise SystemExit("The installed app layout is empty")
+          with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in files:
+                  archive.write(path, path.relative_to(root))
+          PY
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in "${package}" -outform DER -out "${encrypted}" "${certificate}"
+          echo "Encrypted release package: ${encrypted}"
+
+      - name: Upload encrypted Windows release package
+        if: ${{ runner.os == 'Windows' && inputs.release_transfer_certificate != '' && steps.windows-release-package.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: quicksa-next-poc-windows-x64-${{ github.run_id }}
+          path: ${{ runner.temp }}/quicksa-next-poc-windows-x64.zip.cms
+          if-no-files-found: error
+          retention-days: 1
 
       # Also after a failed build or test: the objects compiled so far stay
       # valid.
